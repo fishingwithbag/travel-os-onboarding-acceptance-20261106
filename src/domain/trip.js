@@ -1,0 +1,396 @@
+export const SCHEMA_VERSION = 1;
+
+export class ValidationError extends Error {
+  constructor(message, field = '') {
+    super(message);
+    this.name = 'ValidationError';
+    this.field = field;
+  }
+}
+
+const isoDate = /^\d{4}-\d{2}-\d{2}$/;
+const isoDateTime = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
+const clockTime = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+
+export function isRealDate(value) {
+  if (!isoDate.test(value)) return false;
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
+export function tripDates(startDate, endDate) {
+  if (!isRealDate(startDate) || !isRealDate(endDate) || startDate > endDate) {
+    throw new ValidationError('請選擇有效且依序排列的旅程日期。', 'startDate');
+  }
+  const dates = [];
+  const cursor = new Date(`${startDate}T00:00:00Z`);
+  const end = new Date(`${endDate}T00:00:00Z`);
+  while (cursor <= end) {
+    dates.push(cursor.toISOString().slice(0, 10));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  if (dates.length > 180) throw new ValidationError('單一旅程最多支援 180 天。', 'endDate');
+  return dates;
+}
+
+function clean(value, max, field) {
+  const text = String(value ?? '').trim();
+  if (!text || text.length > max) throw new ValidationError(`${field}格式不正確。`, field);
+  return text;
+}
+
+function cleanOptional(value, max, field) {
+  const text = String(value ?? '').trim();
+  if (text.length > max) throw new ValidationError(`${field}最多 ${max} 字，請縮短後再儲存。`, field);
+  return text;
+}
+
+function cleanMapsUrl(value, field) {
+  const text = cleanOptional(value, 600, field);
+  if (!text) return '';
+  let url;
+  try { url = new URL(text); }
+  catch { throw new ValidationError(`${field}請貼上有效的 Google Maps HTTPS 連結。`, field); }
+  const host = url.hostname.toLowerCase();
+  const isMapsUrl = (['google.com', 'www.google.com'].includes(host) && url.pathname.startsWith('/maps'))
+    || host === 'maps.google.com'
+    || host === 'maps.app.goo.gl'
+    || (host === 'goo.gl' && url.pathname.startsWith('/maps/'));
+  if (url.protocol !== 'https:' || !isMapsUrl) {
+    throw new ValidationError(`${field}只接受 Google Maps HTTPS 連結。`, field);
+  }
+  return url.href;
+}
+
+function cleanParkingSpot(raw = {}, label) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new ValidationError('停車場資料格式不正確。');
+  const spot = { name:cleanOptional(raw.name,120,label), mapsUrl:cleanMapsUrl(raw.mapsUrl,`${label}地圖`) };
+  if (spot.mapsUrl && !spot.name) throw new ValidationError(`請先填寫${label}名稱。`);
+  if (raw.walkMinutes !== '' && raw.walkMinutes != null) {
+    const minutes = Number(raw.walkMinutes);
+    if (!Number.isInteger(minutes) || minutes < 0 || minutes > 1440) throw new ValidationError('停車場步行分鐘須為 0–1440 的整數。');
+    spot.walkMinutes = minutes;
+  }
+  if (raw.feeMinor !== '' && raw.feeMinor != null) {
+    const fee = Number(raw.feeMinor);
+    const currency = String(raw.currency || '').trim().toUpperCase();
+    if (!Number.isSafeInteger(fee) || fee < 0 || fee > 100_000_000_000 || !/^[A-Z]{3}$/.test(currency)) throw new ValidationError('停車費須為有效金額，並填寫三碼幣別。');
+    spot.feeMinor = fee; spot.currency = currency;
+  }
+  const note = cleanOptional(raw.note,300,'停車場備註');
+  if (note) spot.note = note;
+  if (!spot.name && Object.keys(spot).length > 2) throw new ValidationError(`請先填寫${label}名稱，再填步行時間、費用或備註。`);
+  return spot;
+}
+
+function cleanParking(input, trip) {
+  const primary = {
+    name:cleanOptional(input.parkingPrimaryName ?? input.parking?.primary?.name, 120, '主要停車場'),
+    mapsUrl:cleanMapsUrl(input.parkingPrimaryMapsUrl ?? input.parking?.primary?.mapsUrl, '主要停車場地圖'),
+  };
+  const backup = {
+    name:cleanOptional(input.parkingBackupName ?? input.parking?.backup?.name, 120, '備用停車場'),
+    mapsUrl:cleanMapsUrl(input.parkingBackupMapsUrl ?? input.parking?.backup?.mapsUrl, '備用停車場地圖'),
+  };
+  const notes = cleanOptional(input.parkingNotes ?? input.parking?.notes, 300, '停車備註');
+  if (primary.mapsUrl && !primary.name) throw new ValidationError('請先填寫主要停車場名稱。', 'parkingPrimaryName');
+  if (backup.mapsUrl && !backup.name) throw new ValidationError('請先填寫備用停車場名稱。', 'parkingBackupName');
+  const parking = {
+    primary:cleanParkingSpot({...input.parking?.primary,...primary},'主要停車場'),
+    backup:cleanParkingSpot({...input.parking?.backup,...backup},'備用停車場'), notes,
+  };
+  const raw = input.parking;
+  if (raw?.mode && !['shared','split'].includes(raw.mode)) throw new ValidationError('停車模式不支援。');
+  if (raw?.byGroup != null) {
+    if (typeof raw.byGroup !== 'object' || Array.isArray(raw.byGroup)) throw new ValidationError('分組停車資料格式不正確。');
+    parking.byGroup = Object.fromEntries(Object.entries(raw.byGroup).map(([id,set]) => {
+      if (!trip.groups.some(group=>group.id === id) || /[.#$\[\]\/]/.test(id)) throw new ValidationError('停車資料包含不存在或無效的群組。');
+      if (!set || typeof set !== 'object' || Array.isArray(set)) throw new ValidationError('分組停車資料格式不正確。');
+      return [id,{primary:cleanParkingSpot(set.primary,'主要停車場'),backup:cleanParkingSpot(set.backup,'備用停車場'),notes:cleanOptional(set.notes,300,'停車備註')}];
+    }));
+    if (!Object.keys(parking.byGroup).length) delete parking.byGroup;
+  }
+  if (raw?.mode === 'split' && !trip.groups.length) throw new ValidationError('請先新增同行群組，再設定分組停車。');
+  if (raw?.mode) parking.mode = raw.mode;
+  if (!primary.name && !backup.name && !notes && !parking.byGroup && raw?.mode !== 'split') return null;
+  return parking;
+}
+
+function validTimeZone(value, field) {
+  const timeZone = clean(value, 64, field);
+  try { new Intl.DateTimeFormat('zh-TW', { timeZone }).format(); }
+  catch { throw new ValidationError(`請輸入有效的 IANA ${field}。`, field); }
+  return timeZone;
+}
+
+function uniqueIds(entries, label) {
+  const ids = new Set();
+  for (const entry of entries) {
+    if (ids.has(entry.id)) throw new ValidationError(`${label}包含重複 ID。`, 'id');
+    ids.add(entry.id);
+  }
+  return ids;
+}
+
+export function createTrip(input, id = crypto.randomUUID()) {
+  const title = clean(input.title, 80, '旅程名稱');
+  const destination = clean(input.destination, 120, '目的地');
+  const dates = tripDates(input.startDate, input.endDate);
+  const currency = clean(input.currency || 'TWD', 3, '幣別').toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) throw new ValidationError('幣別請使用三碼代號。', 'currency');
+  const timeZone = validTimeZone(input.timeZone || 'UTC', '時區');
+  const now = new Date().toISOString();
+  return { schemaVersion: SCHEMA_VERSION, id, title, destination, startDate: dates[0], endDate: dates.at(-1), timeZone, currency, groups: [], items: [], places: [], rentals: [], stays: [], expenses: [], createdAt: now, updatedAt: now, revision: 1 };
+}
+
+export function createExpense(input,trip,id=crypto.randomUUID()) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new ValidationError('費用資料格式不正確。');
+  if (!isRealDate(input.date) || input.date < trip.startDate || input.date > trip.endDate) throw new ValidationError('費用日期須在旅程範圍內。');
+  const amount=input.amount === '' || input.amount == null ? NaN : Number(input.amount);
+  const currency=String(input.currency || trip.currency).trim().toUpperCase();
+  if (!Number.isFinite(amount) || amount < 0 || amount > 1_000_000_000 || !/^[A-Z]{3}$/.test(currency)) throw new ValidationError('請填寫有效費用及三碼幣別。');
+  const splitCount=Number(input.splitCount);
+  if (!Number.isInteger(splitCount) || splitCount < 1 || splitCount > 1000) throw new ValidationError('分攤人數須為 1–1000 的整數。');
+  const groupId=cleanOptional(input.groupId,100,'群組 ID');
+  if (groupId && !trip.groups.some(group=>group.id === groupId)) throw new ValidationError('費用包含不存在的群組。');
+  return {id:clean(id,100,'費用 ID'),title:clean(input.title,100,'費用名稱'),date:input.date,category:cleanOptional(input.category,50,'費用分類'),groupId,amountMinor:Math.round(amount*100),currency,splitCount,payer:cleanOptional(input.payer,100,'付款人'),notes:cleanOptional(input.notes,1000,'費用備註')};
+}
+
+export function expenseSplit(expense) {
+  return {baseMinor:Math.floor(expense.amountMinor/expense.splitCount),extraCount:expense.amountMinor%expense.splitCount};
+}
+
+export function createStay(input, trip, id = crypto.randomUUID()) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new ValidationError('住宿資料格式不正確。');
+  const groupId=cleanOptional(input.groupId,100,'群組 ID');
+  if (groupId && !trip.groups.some(group=>group.id === groupId)) throw new ValidationError('住宿資料包含不存在的群組。');
+  for (const event of ['checkIn','checkOut']) {
+    const date=input[`${event}Date`],time=input[`${event}Time`];
+    if (!isRealDate(date) || date < trip.startDate || date > trip.endDate || !clockTime.test(time)) throw new ValidationError('請填寫旅程範圍內的入住／退房日期及有效時間。');
+  }
+  if (`${input.checkOutDate}T${input.checkOutTime}` < `${input.checkInDate}T${input.checkInTime}`) throw new ValidationError('退房不可早於入住（依旅程當地時間）。');
+  const currency=String(input.currency || trip.currency).trim().toUpperCase();
+  const amount=input.amount === '' || input.amount == null ? null : Number(input.amount);
+  if (!/^[A-Z]{3}$/.test(currency) || (amount != null && (!Number.isFinite(amount) || amount < 0 || amount > 1_000_000_000))) throw new ValidationError('請填寫有效住宿費用及三碼幣別。');
+  const guests=Number(input.guests);
+  if (!Number.isInteger(guests) || guests < 1 || guests > 1000) throw new ValidationError('住宿人數須為 1–1000 的整數。');
+  return {id:clean(id,100,'住宿 ID'),title:clean(input.title,100,'住宿名稱'),groupId,location:clean(input.location,200,'住宿地址'),mapsUrl:cleanMapsUrl(input.mapsUrl,'住宿地圖'),checkInDate:input.checkInDate,checkInTime:input.checkInTime,checkOutDate:input.checkOutDate,checkOutTime:input.checkOutTime,booking:cleanOptional(input.booking,100,'預訂編號'),notes:cleanOptional(input.notes,1000,'住宿備註'),room:cleanOptional(input.room,100,'房型'),guests,amountMinor:amount == null ? null : Math.round(amount*100),currency};
+}
+
+export function stayItemInput(stay,event) {
+  if (!['checkIn','checkOut'].includes(event)) throw new ValidationError('不支援的住宿行程。');
+  return {type:'stay',title:`${event === 'checkIn' ? '入住' : '退房'} · ${stay.title}`,date:stay[`${event}Date`],startTime:stay[`${event}Time`],location:stay.location,mapsUrl:stay.mapsUrl,groupId:stay.groupId,
+    notes:[stay.room,`${stay.guests} 人`,stay.booking ? `預訂編號：${stay.booking}` : '',stay.notes].filter(Boolean).join('\n')};
+}
+
+export function createRental(input, trip, id = crypto.randomUUID()) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new ValidationError('租車資料格式不正確。');
+  const groupId=cleanOptional(input.groupId,100,'群組 ID');
+  if (groupId && !trip.groups.some(group=>group.id === groupId)) throw new ValidationError('租車資料包含不存在的群組。');
+  const rental={id:clean(id,100,'租車 ID'),groupId,company:clean(input.company,100,'租車公司'),car:cleanOptional(input.car,100,'車型'),branch:cleanOptional(input.branch,200,'租車分店'),booking:cleanOptional(input.booking,100,'預訂編號'),notes:cleanOptional(input.notes,1000,'租車備註')};
+  for (const event of ['pickup','return']) {
+    const date=input[`${event}Date`], time=input[`${event}Time`];
+    if (!isRealDate(date) || date < trip.startDate || date > trip.endDate || !clockTime.test(time)) throw new ValidationError('請填寫旅程範圍內的取還車日期及有效時間。');
+    rental[`${event}Date`]=date; rental[`${event}Time`]=time;
+    rental[`${event}Location`]=clean(input[`${event}Location`],200,event === 'pickup' ? '取車地點' : '還車地點');
+    rental[`${event}MapsUrl`]=cleanMapsUrl(input[`${event}MapsUrl`],event === 'pickup' ? '取車地圖' : '還車地圖');
+  }
+  if (`${rental.returnDate}T${rental.returnTime}` < `${rental.pickupDate}T${rental.pickupTime}`) throw new ValidationError('還車時間不可早於取車時間（依旅程當地時間）。');
+  const currency=String(input.currency || trip.currency).trim().toUpperCase();
+  const amount=input.amount === '' || input.amount == null ? null : Number(input.amount);
+  if (!/^[A-Z]{3}$/.test(currency) || (amount != null && (!Number.isFinite(amount) || amount < 0 || amount > 1_000_000_000))) throw new ValidationError('請填寫有效租車費用及三碼幣別。');
+  return {...rental,currency,amountMinor:amount == null ? null : Math.round(amount*100)};
+}
+
+export function rentalItemInput(rental,event) {
+  if (!['pickup','return'].includes(event)) throw new ValidationError('不支援的租車行程。');
+  return {type:'transport',title:`${event === 'pickup' ? '取車' : '還車'} · ${rental.company}`,date:rental[`${event}Date`],startTime:rental[`${event}Time`],location:rental[`${event}Location`],mapsUrl:rental[`${event}MapsUrl`],groupId:rental.groupId,
+    notes:[rental.branch,rental.car,rental.booking ? `預訂編號：${rental.booking}` : '',rental.notes].filter(Boolean).join('\n')};
+}
+
+export function createPlace(input, id = crypto.randomUUID()) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new ValidationError('景點資料格式不正確。');
+  if (input.favorite != null && typeof input.favorite !== 'boolean') throw new ValidationError('收藏狀態格式不正確。');
+  return {
+    id:clean(id,100,'景點 ID'), title:clean(input.title,100,'景點名稱'),
+    region:cleanOptional(input.region,100,'地區'), category:clean(input.category || '景點',50,'類別'),
+    subcategory:cleanOptional(input.subcategory,50,'子類別'), hours:cleanOptional(input.hours,200,'營業時間'),
+    location:cleanOptional(input.location,200,'地址／位置'), mapsUrl:cleanMapsUrl(input.mapsUrl,'景點地圖'),
+    notes:cleanOptional(input.notes,1000,'景點備註'), favorite:input.favorite ?? false,
+  };
+}
+
+export function filterPlaces(places, {query='',region='',category='',subcategory='',favorites=false,sort='default'} = {}) {
+  const needle = query.trim().toLocaleLowerCase();
+  const filtered = places.filter(place => (!region || place.region === region)
+    && (!category || place.category === category) && (!subcategory || place.subcategory === subcategory)
+    && (!favorites || place.favorite)
+    && (!needle || [place.title,place.region,place.category,place.subcategory,place.location,place.notes,place.hours].some(value=>value.toLocaleLowerCase().includes(needle))));
+  if (sort === 'favorite') filtered.sort((a,b)=>Number(b.favorite)-Number(a.favorite));
+  if (['region','category'].includes(sort)) filtered.sort((a,b)=>a[sort].localeCompare(b[sort],'zh-Hant'));
+  return filtered;
+}
+
+export function placeItemInput(place, date) {
+  return {title:place.title,location:place.location,mapsUrl:place.mapsUrl,notes:[place.notes,place.hours ? `營業時間：${place.hours}` : ''].filter(Boolean).join('\n'),date,
+    type:['餐廳','餐飲'].includes(place.category) ? 'meal' : place.category === '住宿' ? 'stay' : place.category === '其他' ? 'other' : 'place'};
+}
+
+export function createItem(input, trip, id = crypto.randomUUID(), options = {}) {
+  if (!tripDates(trip.startDate, trip.endDate).includes(input.date)) throw new ValidationError('日期不在旅程範圍內。', 'date');
+  const allowedTypes = new Set(['place', 'meal', 'stay', 'flight', 'transport', 'other']);
+  if (!allowedTypes.has(input.type)) throw new ValidationError('行程類型不支援。', 'type');
+  const currency = String(input.currency || trip.currency).trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) throw new ValidationError('幣別請使用三碼代號。', 'currency');
+  const amount = input.amount === '' || input.amount == null ? null : Number(input.amount);
+  if (amount != null && (!Number.isFinite(amount) || amount < 0 || amount > 1_000_000_000)) throw new ValidationError('費用金額不正確。', 'amount');
+  const startTime = cleanOptional(input.startTime, 5, '開始時間');
+  if (startTime && !clockTime.test(startTime)) throw new ValidationError('開始時間格式不正確。', 'startTime');
+  const groupId = cleanOptional(input.groupId, 100, '群組 ID');
+  if (groupId && !trip.groups.some((group) => group.id === groupId)) throw new ValidationError('行程包含不存在的群組。', 'groupId');
+  const item = {
+    id, date: input.date, type: input.type, title: clean(input.title, 100, '名稱'),
+    startTime, location: cleanOptional(input.location, 200, '地址／位置'),
+    mapsUrl: cleanMapsUrl(input.mapsUrl, '目的地地圖'),
+    notes: cleanOptional(input.notes, 1000, '備註'), parking:cleanParking(input,trip), groupId,
+    amountMinor: amount == null ? null : Math.round(amount * 100), currency,
+  };
+  const endTime = cleanOptional(input.endTime, 5, '結束時間');
+  const endDate = cleanOptional(input.endDate, 10, '結束日期');
+  if (input.type !== 'flight' && (endTime || endDate)) {
+    const date = endDate || input.date;
+    if (!startTime || !clockTime.test(endTime) || !isRealDate(date) || date < input.date || date > trip.endDate || (date === input.date && endTime < startTime)) {
+      throw new ValidationError('請填寫開始與結束時間；跨午夜請選擇下一天的結束日期，且不得超過旅程日期。', 'endTime');
+    }
+    item.endDate = date;
+    item.endTime = endTime;
+  }
+  const transitMode = cleanOptional(input.transitMode, 10, '交通方式');
+  if (transitMode && !['driving','walking','transit','other'].includes(transitMode)) throw new ValidationError('交通方式不支援。', 'transitMode');
+  const transitMinutes = input.transitMinutes === '' || input.transitMinutes == null ? null : Number(input.transitMinutes);
+  if (transitMinutes != null && (!transitMode || !Number.isInteger(transitMinutes) || transitMinutes < 0 || transitMinutes > 1440)) throw new ValidationError('請選擇交通方式，交通分鐘須為 0–1440 的整數。', 'transitMinutes');
+  if (transitMode) item.transitMode = transitMode;
+  if (transitMinutes != null) item.transitMinutes = transitMinutes;
+  if (input.type === 'flight') {
+    const departureTimeZone = cleanOptional(input.departureTimeZone, 64, '出發時區');
+    const arrivalTimeZone = cleanOptional(input.arrivalTimeZone, 64, '抵達時區');
+    if (!options.allowLegacyFlightTimeZones && departureTimeZone) validTimeZone(departureTimeZone, '出發時區');
+    if (!options.allowLegacyFlightTimeZones && arrivalTimeZone) validTimeZone(arrivalTimeZone, '抵達時區');
+    const arrivalDateTime = cleanOptional(input.arrivalDateTime, 32, '抵達日期與時間');
+    if (arrivalDateTime && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(arrivalDateTime) || !isRealDate(arrivalDateTime.slice(0,10)) || !clockTime.test(arrivalDateTime.slice(11)))) throw new ValidationError('抵達日期與時間格式不正確。', 'arrivalDateTime');
+    item.flight = {
+      origin: cleanOptional(input.origin, 12, '出發機場').toUpperCase(),
+      destination: cleanOptional(input.destination, 12, '抵達機場').toUpperCase(),
+      departureTimeZone,
+      arrivalTimeZone,
+      arrivalDateTime,
+    };
+  }
+  return item;
+}
+
+export function addGroup(trip, name, id = crypto.randomUUID()) {
+  const normalized = clean(name, 50, '群組名稱');
+  if (trip.groups.some((group) => group.name.toLocaleLowerCase() === normalized.toLocaleLowerCase())) throw new ValidationError('已經有同名群組。', 'name');
+  return { id, name: normalized };
+}
+
+export function editItem(trip, id, input) {
+  const existing = trip.items.find((item) => item.id === id);
+  if (!existing) throw new ValidationError('此安排已不存在，請重新載入旅程。');
+  const updated = createItem({ ...existing, ...existing.flight, amount:existing.amountMinor == null ? '' : existing.amountMinor / 100, ...input }, trip, id);
+  return { ...trip, items:trip.items.map((item) => item.id === id ? updated : item) };
+}
+
+export function expenseTotals(items) {
+  return items.reduce((totals, item) => {
+    if (item.amountMinor != null) totals[item.currency] = (totals[item.currency] || 0) + item.amountMinor;
+    return totals;
+  }, {});
+}
+
+export function touchTrip(trip) {
+  return { ...trip, revision: Number(trip.revision || 0) + 1, updatedAt: new Date().toISOString() };
+}
+
+export function validateTrip(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || value.schemaVersion !== SCHEMA_VERSION) throw new ValidationError('旅程資料版本不支援。');
+  if (!Array.isArray(value.items) || !Array.isArray(value.groups)) throw new ValidationError('旅程資料結構不完整。');
+  if (value.items.length > 10_000) throw new ValidationError('單一旅程的項目數量超過上限。');
+  if (value.groups.length > 1_000) throw new ValidationError('單一旅程的群組數量超過上限。');
+  if (value.places != null && (!Array.isArray(value.places) || value.places.length > 10_000)) throw new ValidationError('景點庫資料格式或數量不正確。');
+  const places = (value.places ?? []).map(place=>createPlace(place,clean(place?.id,100,'景點 ID')));
+  uniqueIds(places,'景點');
+  const id = clean(value.id, 100, '旅程 ID');
+  const normalized = createTrip(value, id);
+  const groups = value.groups.map((group) => ({ id:clean(group?.id,100,'群組 ID'), name:clean(group?.name,50,'群組名稱') }));
+  uniqueIds(groups, '群組');
+  const base = { ...normalized, groups };
+  if (value.rentals != null && (!Array.isArray(value.rentals) || value.rentals.length > 1000)) throw new ValidationError('租車資料格式或數量不正確。');
+  const rentals=(value.rentals ?? []).map(rental=> {
+    if (rental?.amountMinor != null && (!Number.isSafeInteger(rental.amountMinor) || rental.amountMinor < 0 || rental.amountMinor > 100_000_000_000)) throw new ValidationError('租車費用不正確。');
+    return createRental({...rental,amount:rental.amountMinor == null ? '' : rental.amountMinor/100},base,clean(rental?.id,100,'租車 ID'));
+  });
+  uniqueIds(rentals,'租車');
+  if (value.stays != null && (!Array.isArray(value.stays) || value.stays.length > 1000)) throw new ValidationError('住宿資料格式或數量不正確。');
+  const stays=(value.stays ?? []).map(stay=> {
+    if (stay?.amountMinor != null && (!Number.isSafeInteger(stay.amountMinor) || stay.amountMinor < 0 || stay.amountMinor > 100_000_000_000)) throw new ValidationError('住宿費用不正確。');
+    return createStay({...stay,amount:stay.amountMinor == null ? '' : stay.amountMinor/100},base,clean(stay?.id,100,'住宿 ID'));
+  });
+  uniqueIds(stays,'住宿');
+  if (value.expenses != null && (!Array.isArray(value.expenses) || value.expenses.length > 10_000)) throw new ValidationError('費用資料格式或數量不正確。');
+  const expenses=(value.expenses ?? []).map(expense=> {
+    if (!Number.isSafeInteger(expense?.amountMinor) || expense.amountMinor < 0 || expense.amountMinor > 100_000_000_000) throw new ValidationError('費用金額不正確。');
+    return createExpense({...expense,amount:expense.amountMinor/100},base,clean(expense.id,100,'費用 ID'));
+  });
+  uniqueIds(expenses,'費用');
+  const items = value.items.map((item) => {
+    const amountMinor = item?.amountMinor;
+    if (amountMinor != null && (!Number.isSafeInteger(Number(amountMinor)) || Number(amountMinor) < 0 || Number(amountMinor) > 100_000_000_000)) throw new ValidationError('費用金額不正確。', 'amountMinor');
+    return createItem({
+      ...item,
+      amount:amountMinor == null ? '' : Number(amountMinor) / 100,
+      origin:item.flight?.origin,
+      destination:item.flight?.destination,
+      departureTimeZone:item.flight?.departureTimeZone,
+      arrivalTimeZone:item.flight?.arrivalTimeZone,
+      arrivalDateTime:item.flight?.arrivalDateTime,
+    }, base, clean(item?.id,100,'行程 ID'), { allowLegacyFlightTimeZones:true });
+  });
+  uniqueIds(items, '行程');
+  const revision = Number(value.revision);
+  if (!Number.isSafeInteger(revision) || revision < 1) throw new ValidationError('旅程版本號不正確。', 'revision');
+  const createdAt = String(value.createdAt || '');
+  const updatedAt = String(value.updatedAt || '');
+  if (!isoDateTime.test(createdAt) || !isoDateTime.test(updatedAt) || !Number.isFinite(Date.parse(createdAt)) || !Number.isFinite(Date.parse(updatedAt)) || Date.parse(updatedAt) < Date.parse(createdAt)) throw new ValidationError('旅程時間戳記格式不正確。');
+  return { ...base, items, places, rentals, stays, expenses, createdAt, updatedAt, revision };
+}
+
+export function validateBackup(value) {
+  if (!value || typeof value !== 'object' || value.schemaVersion !== SCHEMA_VERSION || !Array.isArray(value.trips)) throw new ValidationError('這不是支援的 Travel OS 備份。');
+  if (value.trips.length > 100) throw new ValidationError('備份內的旅程數量超過上限。');
+  const trips = value.trips.map(validateTrip);
+  uniqueIds(trips, '旅程');
+  return { schemaVersion:SCHEMA_VERSION, exportedAt:String(value.exportedAt || ''), mode:value.mode === 'share' ? 'share' : 'private', trips };
+}
+
+export function restoredTripCopy(value,id=crypto.randomUUID()) {
+  const trip=validateTrip(value);
+  const now=new Date().toISOString();
+  return validateTrip({...trip,id,revision:1,createdAt:now,updatedAt:now});
+}
+
+export function createBackup(trips, mode = 'private') {
+  const privateCopy = structuredClone(trips);
+  const exportTrips = mode === 'share' ? privateCopy.map((trip) => ({
+    ...trip,
+    groups:[],
+    places:[],
+    rentals:[],
+    stays:[],
+    expenses:[],
+    items:trip.items.map(({ notes, parking, mapsUrl, groupId, amountMinor, currency, ...item }) => ({ ...item, notes:'', parking:null, mapsUrl:'', groupId:'', amountMinor:null, currency:trip.currency })),
+  })) : privateCopy;
+  return { schemaVersion:SCHEMA_VERSION, exportedAt:new Date().toISOString(), mode:mode === 'share' ? 'share' : 'private', trips:exportTrips };
+}
